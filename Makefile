@@ -9,7 +9,8 @@ GOFILES = \
 	socketio.go \
 	connection.go \
 	codec.go \
-	siocodec.go \
+	codec_sio.go \
+	rpc.go \
 	transport.go \
 	transport_xhrpolling.go \
 	transport_xhrmultipart.go \

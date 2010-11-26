@@ -70,10 +70,6 @@
 package socketio
 
 import (
-	"bytes"
-	"net"
-	"io"
-	"fmt"
 	"http"
 	"os"
 	"strings"
@@ -83,10 +79,15 @@ import (
 // SocketIO handles transport abstraction and provide the user
 // a handfull of callbacks to observe different events.
 type SocketIO struct {
-	sessions     map[SessionID]*Conn // Holds the outstanding sessions.
-	sessionsLock *sync.RWMutex       // Protects the sessions.
-	config       Config              // Holds the configuration values.
-	muxed        bool                // Is the server muxed already.
+	sessions map[SessionID]*Conn // Holds the outstanding sessions.
+	mutex    *sync.RWMutex       // Protects the sessions.
+	config   Config              // Holds the configuration values.
+	muxed    bool                // Is the server muxed already.
+
+	totalPacketsSent     int64
+	totalPacketsReceived int64
+	totalSessions        int64
+	totalRequests        int64
 
 	// The callbacks set by the user
 	callbacks struct {
@@ -95,7 +96,6 @@ type SocketIO struct {
 		onMessage    func(*Conn, Message) // Invoked on a message.
 	}
 }
-
 
 // NewSocketIO creates a new socketio server with chosen transports and configuration
 // options. If transports is nil, the DefaultTransports is used. If config is nil, the
@@ -106,9 +106,9 @@ func NewSocketIO(config *Config) *SocketIO {
 	}
 
 	return &SocketIO{
-		config:       *config,
-		sessions:     make(map[SessionID]*Conn),
-		sessionsLock: new(sync.RWMutex),
+		config:   *config,
+		sessions: make(map[SessionID]*Conn),
+		mutex:    new(sync.RWMutex),
 	}
 }
 
@@ -121,8 +121,8 @@ func (sio *SocketIO) Broadcast(data interface{}) {
 // c. It does not care about the type of data, but it must marshallable
 // by the standard json-package.
 func (sio *SocketIO) BroadcastExcept(c *Conn, data interface{}) {
-	sio.sessionsLock.RLock()
-	defer sio.sessionsLock.RUnlock()
+	sio.mutex.RLock()
+	defer sio.mutex.RUnlock()
 
 	for _, v := range sio.sessions {
 		if v != c {
@@ -133,9 +133,9 @@ func (sio *SocketIO) BroadcastExcept(c *Conn, data interface{}) {
 
 // GetConn digs for a session with sessionid and returns it.
 func (sio *SocketIO) GetConn(sessionid SessionID) (c *Conn) {
-	sio.sessionsLock.RLock()
+	sio.mutex.RLock()
 	c = sio.sessions[sessionid]
-	sio.sessionsLock.RUnlock()
+	sio.mutex.RUnlock()
 	return
 }
 
@@ -229,6 +229,10 @@ func (sio *SocketIO) handle(t Transport, w http.ResponseWriter, req *http.Reques
 	var c *Conn
 	var err os.Error
 
+	sio.mutex.Lock()
+	sio.totalRequests++
+	sio.mutex.Unlock()
+
 	if origin, ok := req.Header["Origin"]; ok {
 		if _, ok = sio.verifyOrigin(origin); !ok {
 			sio.Log("sio/handle: unauthorized origin:", origin)
@@ -300,9 +304,10 @@ func (sio *SocketIO) handle(t Transport, w http.ResponseWriter, req *http.Reques
 // established succesfully. The establised connection is passed as an
 // argument. It stores the connection and calls the user's OnConnect callback.
 func (sio *SocketIO) onConnect(c *Conn) {
-	sio.sessionsLock.Lock()
+	sio.mutex.Lock()
 	sio.sessions[c.sessionid] = c
-	sio.sessionsLock.Unlock()
+	sio.totalSessions++
+	sio.mutex.Unlock()
 
 	if sio.callbacks.onConnect != nil {
 		sio.callbacks.onConnect(c)
@@ -312,9 +317,11 @@ func (sio *SocketIO) onConnect(c *Conn) {
 // OnDisconnect is invoked by a connection when the connection is considered
 // to be lost. It removes the connection and calls the user's OnDisconnect callback.
 func (sio *SocketIO) onDisconnect(c *Conn) {
-	sio.sessionsLock.Lock()
+	sio.mutex.Lock()
 	sio.sessions[c.sessionid] = nil, false
-	sio.sessionsLock.Unlock()
+	sio.totalPacketsSent += int64(c.numPacketsSent)
+	sio.totalPacketsReceived += int64(c.numPacketsReceived)
+	sio.mutex.Unlock()
 
 	if sio.callbacks.onDisconnect != nil {
 		sio.callbacks.onDisconnect(c)
@@ -366,86 +373,4 @@ func (sio *SocketIO) verifyOrigin(reqOrigin string) (string, bool) {
 	}
 
 	return "", false
-}
-
-func (sio *SocketIO) generatePolicyFile() []byte {
-	buf := new(bytes.Buffer)
-	buf.WriteString(`<?xml version="1.0"?>
-<!DOCTYPE cross-domain-policy SYSTEM "http://www.macromedia.com/xml/dtds/cross-domain-policy.dtd">
-<cross-domain-policy>
-	<site-control permitted-cross-domain-policies="master-only" />
-`)
-
-	if sio.config.Origins != nil {
-		for _, origin := range sio.config.Origins {
-			parts := strings.Split(origin, ":", 2)
-			if len(parts) < 1 {
-				continue
-			}
-			host, port := "*", "*"
-			if parts[0] != "" {
-				host = parts[0]
-			}
-			if len(parts) == 2 && parts[1] != "" {
-				port = parts[1]
-			}
-
-			fmt.Fprintf(buf, "\t<allow-access-from domain=\"%s\" to-ports=\"%s\" />\n", host, port)
-		}
-	}
-
-	buf.WriteString("</cross-domain-policy>\n")
-	return buf.Bytes()
-}
-
-func (sio *SocketIO) ListenAndServeFlashPolicy(laddr string) os.Error {
-	var listener net.Listener
-
-	listener, err := net.Listen("tcp", laddr)
-	if err != nil {
-		return err
-	}
-
-	policy := sio.generatePolicyFile()
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			sio.Log("ServeFlashsocketPolicy:", err)
-			continue
-		}
-
-		go func() {
-			defer conn.Close()
-
-			buf := make([]byte, 20)
-			if _, err := io.ReadFull(conn, buf); err != nil {
-				sio.Log("ServeFlashsocketPolicy:", err)
-				return
-			}
-			if !bytes.Equal([]byte("<policy-file-request"), buf) {
-				sio.Logf("ServeFlashsocketPolicy: expected \"<policy-file-request\" but got %q", buf)
-				return
-			}
-
-			var nw int
-			for nw < len(policy) {
-				n, err := conn.Write(policy[nw:])
-				if err != nil && err != os.EAGAIN {
-					sio.Log("ServeFlashsocketPolicy:", err)
-					return
-				}
-				if n > 0 {
-					nw += n
-					continue
-				} else {
-					sio.Log("ServeFlashsocketPolicy: wrote 0 bytes")
-					return
-				}
-			}
-			sio.Log("ServeFlashsocketPolicy: served", conn.RemoteAddr())
-		}()
-	}
-
-	return nil
 }

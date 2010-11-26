@@ -23,25 +23,29 @@ var (
 // Conn represents a single session and handles its handshaking,
 // message buffering and reconnections.
 type Conn struct {
-	mutex            sync.Mutex
-	socket           socket    // The i/o connection that abstract the transport.
-	sio              *SocketIO // The server.
-	sessionid        SessionID
-	online           bool
-	lastConnected    int64
-	lastDisconnected int64
-	lastHeartbeat    heartbeat
-	numHeartbeats    int
-	ticker           *time.Ticker
-	queue            chan interface{} // Buffers the outgoing messages.
-	numConns         int              // Total number of reconnects.
-	handshaked       bool             // Indicates if the handshake has been sent.
-	disconnected     bool             // Indicates if the connection has been disconnected.
-	wakeupFlusher    chan byte        // Used internally to wake up the flusher.
-	wakeupReader     chan byte        // Used internally to wake up the reader.
-	enc              Encoder
-	dec              Decoder
-	decBuf           bytes.Buffer
+	mutex              sync.Mutex
+	socket             socket    // The i/o connection that abstract the transport.
+	sio                *SocketIO // The server.
+	sessionid          SessionID
+	online             bool
+	raddr              string
+	ua                 string
+	firstConnected     int64
+	lastDisconnected   int64
+	lastHeartbeat      heartbeat
+	numHeartbeats      int
+	ticker             *time.Ticker
+	queue              chan interface{} // Buffers the outgoing messages.
+	numConns           int              // Total number of reconnects.
+	handshaked         bool             // Indicates if the handshake has been sent.
+	disconnected       bool             // Indicates if the connection has been disconnected.
+	wakeupFlusher      chan byte        // Used internally to wake up the flusher.
+	wakeupReader       chan byte        // Used internally to wake up the reader.
+	enc                Encoder
+	dec                Decoder
+	decBuf             bytes.Buffer
+	numPacketsSent     int
+	numPacketsReceived int
 }
 
 // NewConn creates a new connection for the sio. It generates the session id and
@@ -72,6 +76,18 @@ func newConn(sio *SocketIO) (c *Conn, err os.Error) {
 // fmt.Stringer interface.
 func (c *Conn) String() string {
 	return fmt.Sprintf("%v[%v]", c.sessionid, c.socket)
+}
+
+func (c *Conn) RemoteAddr() string {
+	return c.raddr
+}
+
+func (c *Conn) UserAgent() string {
+	return c.ua
+}
+
+func (c *Conn) Transport() Transport {
+	return c.socket.Transport()
 }
 
 // Send queues data for a delivery. It is totally content agnostic with one exception:
@@ -132,6 +148,8 @@ func (c *Conn) handle(t Transport, w http.ResponseWriter, req *http.Request) (er
 		return
 	}
 
+	c.raddr = w.RemoteAddr()
+
 	s := t.newSocket()
 	err = s.accept(w, req, func() {
 		if c.socket != nil {
@@ -139,9 +157,11 @@ func (c *Conn) handle(t Transport, w http.ResponseWriter, req *http.Request) (er
 		}
 		c.socket = s
 		c.online = true
-		c.lastConnected = time.Nanoseconds()
 
 		if !c.handshaked {
+			c.firstConnected = time.Seconds()
+			c.ua = req.Header["User-Agent"]
+
 			// the connection has not been handshaked yet.
 			if err = c.handshake(); err != nil {
 				c.sio.Log("sio/conn: handle/handshake:", err, c)
@@ -198,6 +218,7 @@ func (c *Conn) receive(data []byte) {
 	}
 
 	for _, m := range msgs {
+		c.numPacketsReceived++
 		if hb, ok := m.heartbeat(); ok {
 			c.lastHeartbeat = hb
 		} else {
@@ -282,6 +303,9 @@ func (c *Conn) flusher() {
 			for {
 				c.mutex.Lock()
 				_, err = buf.WriteTo(c.socket)
+				if err == nil {
+					c.numPacketsSent += n
+				}
 				c.mutex.Unlock()
 
 				if err == nil {
@@ -327,12 +351,14 @@ func (c *Conn) reader() {
 			} else if nr < 0 {
 				break
 			} else if nr > 0 {
+				c.mutex.Lock()
 				c.receive(buf[0:nr])
+				c.mutex.Unlock()
 			}
 		}
 
 		c.mutex.Lock()
-		c.lastDisconnected = time.Nanoseconds()
+		c.lastDisconnected = time.Seconds()
 		socket.Close()
 		if c.socket == socket {
 			c.online = false

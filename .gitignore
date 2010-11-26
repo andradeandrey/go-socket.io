@@ -1,5 +1,7 @@
 example/example
+cli/cli
 *.o
 *.a
 *.[568vq]
 [568vq].out
+_testmain.*
